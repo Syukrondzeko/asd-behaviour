@@ -8,4 +8,7 @@ app.py
 *.gradio
 /.reuse
 
-.pre-commit-config.yaml
+.pre-commit-config.yamlcheckpoints/
+sample_flame/
+sample_input/
+checkpoints/

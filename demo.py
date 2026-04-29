@@ -58,7 +58,7 @@ parser.add_argument(
     "--batch-size", type=int, default=24, help="Batch size that can fit in RAM or GPU."
 )
 parser.add_argument(
-    "--num-workers", type=int, default=4, help="Number of worker for multiprocessing dataloader."
+    "--num-workers", type=int, default=0, help="Number of worker for multiprocessing dataloader."
 )
 
 args = parser.parse_args()
@@ -278,7 +278,7 @@ class Gaze3DDemo:
         window_stride (int): only for video inference Stride used to create a clip. 1 seems to be provide more stable gaze.
         device (str): Device to use for inference. (options: "cpu", "cuda")
         batch_size (int): Batch size that can fit in RAM or GPU. (consider increasing for faster inference on video)
-        num_workers (int): Number of worker for multiprocessing dataloader. (consider increasing for faster inference on video)
+        num_workers (int): Number of worker for multiprocessing dataloader. Keep 0 in Docker/low-shm environments.
 
     Example:
         demo = Gaze3DDemo(
@@ -289,7 +289,7 @@ class Gaze3DDemo:
             window_stride=1,
             device="cuda",
             batch_size=16,
-            num_workers=4
+            num_workers=0
         )
         demo.run() # detect, track, predict gaze and draw the output
 
@@ -309,7 +309,7 @@ class Gaze3DDemo:
         window_stride: int = 1,
         device: str = "cpu",
         batch_size: int = 16,
-        num_workers: int = 1,
+        num_workers: int = 0,
     ):
         # Initialize arguments
         self.input_filename = input_filename
@@ -388,7 +388,7 @@ class Gaze3DDemo:
         self,
     ):
         # Read Video Clip
-        cap = cv2.VideoCapture(self.self.input_filename)
+        cap = cv2.VideoCapture(self.input_filename)
         ret, frame = cap.read()
         frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
 
@@ -545,25 +545,32 @@ class Gaze3DDemo:
         else:
             raise ValueError("Unsupported input modality.")
 
-        dataloader = DataLoader(
-            dataset,
-            batch_size=self.batch_size,
-            num_workers=self.num_workers,
-            shuffle=False,
-        )
+        def _run_inference(num_workers):
+            dataloader = DataLoader(
+                dataset,
+                batch_size=self.batch_size,
+                num_workers=num_workers,
+                shuffle=False,
+            )
 
-        gaze_stack = []
-        # Iterate over the dataset
-        for sample in tqdm(dataloader, desc="Predicting Gaze"):
-            # Predict
-            with torch.no_grad():
-                pred = self.model(sample["images"].to(self.device))
-                gaze = torch.nn.functional.normalize(pred["gaze"], p=2, dim=2, eps=1e-8)
-                t = gaze.size(1)
-                t = (
-                    (t // 2) if t == 1 or t % 2 != 0 else (t // 2) - 1
-                )  # defined middle frame in even case
-                gaze_stack.append(gaze[:, t, :].cpu().numpy())
+            gaze_values = []
+            for sample in tqdm(dataloader, desc="Predicting Gaze"):
+                with torch.no_grad():
+                    pred = self.model(sample["images"].to(self.device))
+                    gaze = torch.nn.functional.normalize(pred["gaze"], p=2, dim=2, eps=1e-8)
+                    t = gaze.size(1)
+                    t = (t // 2) if t == 1 or t % 2 != 0 else (t // 2) - 1
+                    gaze_values.append(gaze[:, t, :].cpu().numpy())
+            return gaze_values
+
+        try:
+            gaze_stack = _run_inference(self.num_workers)
+        except RuntimeError as e:
+            if "DataLoader worker" in str(e) and self.num_workers > 0:
+                print("DataLoader worker failed (likely low /dev/shm). Retrying with --num-workers 0...")
+                gaze_stack = _run_inference(0)
+            else:
+                raise
         # Save the gaze predictions
         gaze_stack = np.vstack(gaze_stack)
         detect_heads = pd.read_csv(self.detected_head_file)
