@@ -196,7 +196,8 @@ def _draw_single_embedded_eye(frame, eye_pts_px, pupil_offset_px, max_radius_px)
 
 
 def draw_gaze_eyeballs(frame, gaze_vector, lm2d_frame, eyeball_radius=26,
-                       camera_pose=None, yfov=None, aspect_ratio=1.0):
+                       camera_pose=None, yfov=None, aspect_ratio=1.0,
+                       pupil_gain=1.8):
     """Draw gaze-driven irises inside eye regions using FLAME 2D landmarks."""
     # Expected 68-point layout: left eye [36:42], right eye [42:48]
     if lm2d_frame is None or lm2d_frame.shape[0] < 48:
@@ -217,14 +218,40 @@ def draw_gaze_eyeballs(frame, gaze_vector, lm2d_frame, eyeball_radius=26,
     right_eye = lm_px[42:48]
 
     gaze_n = gaze_vector / (np.linalg.norm(gaze_vector) + 1e-6)
-    offset_scale = float(eyeball_radius) * 0.22
-    pupil_offset = np.array([
-        -gaze_n[0] * offset_scale,
-        -gaze_n[1] * offset_scale,
-    ], dtype=np.float32)
 
-    frame = _draw_single_embedded_eye(frame, left_eye, pupil_offset, max_radius_px=eyeball_radius)
-    frame = _draw_single_embedded_eye(frame, right_eye, pupil_offset, max_radius_px=eyeball_radius)
+    def eye_local_offset(eye_pts):
+        # Eye-local basis from landmarks so motion follows eye orientation on screen.
+        eye_center = np.mean(eye_pts, axis=0)
+        left_corner = eye_pts[0]
+        right_corner = eye_pts[3]
+        x_axis = right_corner - left_corner
+        x_norm = np.linalg.norm(x_axis)
+        if x_norm < 1e-6:
+            return np.zeros(2, dtype=np.float32)
+        x_axis = x_axis / x_norm
+        y_axis = np.array([-x_axis[1], x_axis[0]], dtype=np.float32)
+
+        # Project eye polygon extents into local axes.
+        rel = eye_pts - eye_center[None, :]
+        u = rel @ x_axis
+        v = rel @ y_axis
+        u_half = max(float(np.max(np.abs(u))), 1.0)
+        v_half = max(float(np.max(np.abs(v))), 1.0)
+
+        # Map gaze to local motion; keep arrow sign convention on x/y.
+        du = (-gaze_n[0]) * u_half * 0.78 * float(pupil_gain)
+        dv = (-gaze_n[1]) * v_half * 0.78 * float(pupil_gain)
+
+        # Clamp to remain inside eye region visually.
+        du = float(np.clip(du, -u_half * 0.9, u_half * 0.9))
+        dv = float(np.clip(dv, -v_half * 0.9, v_half * 0.9))
+        return (x_axis * du + y_axis * dv).astype(np.float32)
+
+    left_offset = eye_local_offset(left_eye)
+    right_offset = eye_local_offset(right_eye)
+
+    frame = _draw_single_embedded_eye(frame, left_eye, left_offset, max_radius_px=eyeball_radius)
+    frame = _draw_single_embedded_eye(frame, right_eye, right_offset, max_radius_px=eyeball_radius)
     return frame
 
 
@@ -253,7 +280,8 @@ def render_npz_to_video(npz_path, output_path, audio_path=None, texture_path=Non
                         fps=25, render_speaker=True, render_listener=True,
                         black_bg=False, size=(640, 640), auto_audio=True,
                         apply_gaze=True, gaze_eyeball_radius=26,
-                        draw_gaze_eyeball_overlay=True, output_role_suffix=None):
+                        draw_gaze_eyeball_overlay=True, output_role_suffix=None,
+                        pupil_gain=1.8):
     """
     Render FLAME coefficients from .npz file to video(s), optionally applying
     gaze stored in the 'gaze' key of the npz and drawing gaze eyeballs.
@@ -357,8 +385,10 @@ def render_npz_to_video(npz_path, output_path, audio_path=None, texture_path=Non
         print(f"Duration: {num_frames / fps:.2f} seconds")
 
         # Build eye_pose_params from gaze (zeros if no gaze available)
+        # Avoid double-applying gaze when using eyeball overlay.
+        gaze_for_eye_pose = None if draw_gaze_eyeball_overlay else raw_gaze
         eye_pose_params = build_eye_pose_params(
-            raw_gaze, person_idx if is_2d_format else 0,
+            gaze_for_eye_pose, person_idx if is_2d_format else 0,
             is_2d=is_2d_format, n_frames=num_frames, device=device
         )
         if raw_gaze is not None:
@@ -423,6 +453,7 @@ def render_npz_to_video(npz_path, output_path, audio_path=None, texture_path=Non
                     camera_pose=renderer.camera_pose,
                     yfov=renderer.camera.yfov,
                     aspect_ratio=renderer.camera.aspectRatio,
+                    pupil_gain=pupil_gain,
                 )
 
             writer.write(cv2.cvtColor(rendered, cv2.COLOR_RGB2BGR))
@@ -470,6 +501,8 @@ def main():
                         help='Disable gaze injection even if gaze key exists in npz')
     parser.add_argument('--gaze-eyeball-radius', type=int, default=26,
                         help='Eyeball radius in pixels (default: 26)')
+    parser.add_argument('--pupil-gain', type=float, default=1.8,
+                        help='Gain for pupil motion inside eye (default: 1.8)')
     parser.add_argument('--no-gaze-eyeball', '--no-gaze-arrow',
                         dest='no_gaze_eyeball', action='store_true',
                         help='Disable gaze eyeball overlay even if gaze data exists')
@@ -505,6 +538,7 @@ def main():
         gaze_eyeball_radius=args.gaze_eyeball_radius,
         draw_gaze_eyeball_overlay=not args.no_gaze_eyeball,
         output_role_suffix=output_role_suffix,
+        pupil_gain=args.pupil_gain,
     )
 
 
